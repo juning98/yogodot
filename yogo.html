@@ -254,8 +254,10 @@
       </div><!-- /claudeOnly -->
 
       <div class="note" style="margin-top:14px">
-        画面是实时发给键盘的，<b>不存进键盘里</b> —— 所以软件要在后台开着；
-        关掉后键盘上留着最后一个画面，重新打开会自动补上。只有切换背光模式时会改一次键盘设置。<br>
+        点阵自定义图是实时发给键盘的，<b>不存进键盘里</b> —— 所以软件要在后台开着；
+        关掉后键盘上留着最后一个画面，重新打开会自动补上。逐键配色会写进键盘的
+        <b>自定义灯效缓冲区</b>（模式 253），切主题只写一次；打开<b>固件动画</b>后，
+        点阵和背光交给键盘内置效果，主机不再持续占用 2.4G。<br>
         休眠调长了状态灯才等得到你回来，代价是耗电 —— 15 分钟是我建议的平衡点。
       </div>
     </aside>
@@ -306,6 +308,10 @@
         <div class="row" style="margin:10px 0 4px">
           <button class="btn" id="dynBtn">静态</button>
           <span style="color:var(--dim2);font-size:12px" id="dynHint">点阵屏和键盘都定格，最省电</span>
+        </div>
+        <div class="row" style="margin:6px 0 4px">
+          <label class="row" style="gap:6px"><input type="checkbox" id="fwAnim">
+            <span style="color:var(--dim2);font-size:12.5px">固件动画（点阵用键盘内置效果，不持续占 2.4G）</span></label>
         </div>
         <div class="chips" id="themes" style="margin-top:14px"></div>
         <p class="label" style="margin-top:24px">单独点阵图 · 屏和灯一起换</p>
@@ -564,6 +570,7 @@ let FW_FX=(()=>{ const v=localStorage.getItem("yogo_fwfx");
   return (v===null||v==="") ? null : +v; })();   // 只亮点阵屏：键盘灯全熄，屏照常
 async function pushKeys(arr, force){
   if(FW_FX!=null||KB_OFF){ drawKeyboard(new Array(KB_N).fill([0,0,0])); return; }  // 交给固件 / 已关，一个字节都不发
+  if(streamOn===253){ drawKeyboard(arr||new Array(KB_N).fill([0,0,0])); return; }  // 配色在设备缓冲区里
   const p=[], k=KB_BRIGHT/100;
   for(let i=0;i<KB_N;i++){
     const c=RAW ? (arr[i]||[0,0,0]) : gr(ledize(arr[i]||[0,0,0]));
@@ -1422,6 +1429,23 @@ const THEMES={
     kbAnim: kbCaps([120,0,18],[26,0,6],[255,45,55],{breathe:1.9}) }
 };
 
+/* ── 固件内置效果映射 ────────────────────────────────────────────
+   开「固件动画」后：点阵用键盘固件的 12 个内置效果（0-12，6=自定义），
+   背光用内置灯效（0-20），两者都由固件自己跑，主机不再持续推帧。
+   没有映射的主题 = 单帧自定义图 + 写 VIA 自定义灯效缓冲区。 */
+const FW_DOT = {
+  starry:0, jelly:1, aurora:3, weather:4, lava:8, emoji:10, matrix:11,
+  sunset:3, heartbeat:9,
+};
+/* [blMode, colorful]；colorful=0 时用主题的 light 颜色 */
+const FW_KB = {
+  pikachu:[3,0], claude:[3,0], pacman:[5,1], doraemon:[3,0], pokeball:[18,1],
+  lava:[3,0], aurora:[20,1], sunset:[15,1], matrix:[13,1], emoji:[5,1],
+  weather:[9,1], shiba:[3,0], panda:[3,0], penguin:[3,0], jelly:[3,0],
+  starry:[1,1], miku:[3,0], veggie:[3,0], fruit:[3,0], animal:[3,0],
+  eva01:[3,0], eva00:[3,0], minecraft:[3,0], heartbeat:[3,0],
+};
+
 /* 表情素材：X = 主色，o = 半亮。键盘配色跟着当前表情的情绪走 */
 const MOOD_T=2.6;
 const MOODS=[
@@ -1674,7 +1698,7 @@ function runAnim(fn,fps,ms){
 async function showStatic(rgb){ stopAnim(); try{ await pushMatrix(rgb, true); }catch(e){} }
 
 /* 背光走推流：进一次流式模式（一次 flash 写），之后全部是 RAM，随便刷 */
-let streamOn=null, lightNow=null;
+let streamOn=null, dotMode=null, lightNow=null;
 /* 键盘没应答时把话说明白 —— 之前是静悄悄什么都不做，看着就像软件坏了 */
 function markAsleep(){
   awake=false;
@@ -1720,11 +1744,12 @@ async function enterStreamMode(){
      以前只在原厂灯效下才写 0，我们自己的推流模式下「熄灭」只是推一帧全黑继续流着 ——
      灯是黑的，驱动和推流态都还醒着，电照样掉。 */
   const want = KB_OFF ? 0 : FW_FX==null ? BL_STREAM : FW_FX;
-  if(streamOn===want) return true;
+  if(streamOn===want && dotMode===DS_CUSTOM) return true;
   try{ await patchConfig({ blMode:want, blBright:90,
-         blColorful: FW_FX==null?0:1,               // 原厂灯效放开彩色，用它自带的配色
-         dsMode:DS_CUSTOM, dsBright:90 });
-       streamOn=want; return true; }
+         blColorful: FW_FX==null?0:1 });
+       /* 官方进入自定义点阵前先 end_sync_dot，再写 mode=6；照它做 */
+       await kbCall("/kb/dotmode",{mode:DS_CUSTOM, brightness:90, sync:true});
+       streamOn=want; dotMode=DS_CUSTOM; return true; }
   catch(e){ lastErr="进流模式失败: "+String(e&&e.message||e).slice(0,90);
             markAsleep(); return false; }
 }
@@ -1755,6 +1780,7 @@ let MODE=localStorage.getItem("yogo_mode")||"theme";
 let THEME=localStorage.getItem("yogo_theme")||"pikachu";
 if(!THEMES[THEME]) THEME="pikachu";                       // 旧存档里的主题名可能已不存在
 let THEME_DYN=localStorage.getItem("yogo_dyn")==="1";
+let FW_ANIM=localStorage.getItem("yogo_fwanim")==="1";
 const THEME_KEYS=Object.keys(THEMES);
 let LAST_RESIDENT=localStorage.getItem("yogo_resident")||"theme";   // 专注/启动 结束后回到这里
 
@@ -1806,6 +1832,54 @@ async function applyMode(id, isReattach){
   if(id==="vibe"){ if(await enterStreamMode()) vibePaint(); return; }
 }
 /** 主题运行器：点阵屏 + 键盘一起驱动。静态 = 推一次，动态 = 低帧率一起动 */
+function kbGrid(rgb84){
+  const g=Array.from({length:6},()=>Array.from({length:16},()=>[0,0,0]));
+  for(let r=0;r<6;r++) for(let c=0;c<16;c++){
+    const idx=KB_MAP[r][c];
+    if(idx!==255 && rgb84[idx]) g[r][c]=rgb84[idx].map(v=>clamp(v));
+  }
+  return g;
+}
+async function storeKeys(rgb84){
+  try{
+    const d=await kbCall("/kb/lightbuf",{colors:kbGrid(rgb84)});
+    if(d && d.ok){ streamOn=253; return true; }
+    lastErr=(d&&d.why)||"写入自定义灯效缓冲区失败";
+  }catch(e){ lastErr=String(e&&e.message||e).slice(0,120); }
+  return false;
+}
+async function pushThemeKeys(t){
+  const arr=t.kb(0);
+  if(KB_OFF || FW_FX!=null){ drawKeyboard(arr); return; }
+  if(await storeKeys(arr)){ drawKeyboard(arr); return; }
+  await pushKeys(arr, true);                     // VIA 不可用：退回 cmd 46 推流
+}
+/** 固件动画：点阵/背光交给键盘自己跑，主机零持续推流 */
+async function applyFirmwareTheme(t){
+  stopAnim(); lightNow=null;
+  if(ART_PICK && STATICS[ART_PICK.name]){ artPush(STATICS[ART_PICK.name], ART_PICK.idx|0); return; }
+  const dot=FW_DOT[THEME];
+  if(dot!=null){
+    /* 官方 setDotLight 固定 colorful=0，颜色走 LedTFTColorR/G/B */
+    await kbCall("/kb/dotmode",{mode:dot, brightness:90, speed:3, colorful:0,
+                                color:t.light, sync:true});
+    dotMode=dot;
+  }else{
+    await kbCall("/kb/dotmode",{mode:DS_CUSTOM, brightness:90, sync:true});
+    dotMode=DS_CUSTOM;
+    await pushMatrix(rows2rgb(t.dot), true);
+  }
+  if(KB_OFF) return;
+  const fk=FW_KB[THEME];
+  if(fk){
+    const bytes={ [CFG.blMode]:fk[0], [CFG.blBright]:90, [CFG.blColorful]:fk[1] };
+    if(!fk[1]){ bytes[CFG.blR]=t.light[0]; bytes[CFG.blG]=t.light[1]; bytes[CFG.blB]=t.light[2]; }
+    await kbCall("/kb/config",{bytes});
+    streamOn=fk[0];
+  }else{
+    await pushThemeKeys(t);
+  }
+}
 function runTheme(t, dyn){
   stopAnim(); lightNow=null;
   if(ART_PICK && STATICS[ART_PICK.name]){       // 画廊里挑过图：主题的点阵图让位
@@ -1814,7 +1888,7 @@ function runTheme(t, dyn){
   }
   if(!dyn){
     /* 静态主题：推一帧就完事，之后零流量。 */
-    (async()=>{ try{ await pushKeys(t.kb(0), true); await pushMatrix(rows2rgb(t.dot), true); }catch(e){} })();
+    (async()=>{ try{ await pushThemeKeys(t); await pushMatrix(rows2rgb(t.dot), true); }catch(e){} })();
     liveFn=null;
     return;
   }
@@ -1838,8 +1912,10 @@ async function applyTheme(k){
   syncPickUI();
   if(!await enterStreamMode()){ console.warn("applyTheme 中止：", lastErr); return; }
   markAwake();
-  try{ runTheme(THEMES[k], THEME_DYN); }
-  catch(e){ lastErr=String(e&&e.message||e).slice(0,120); }
+  try{
+    if(FW_ANIM) await applyFirmwareTheme(THEMES[k]);
+    else runTheme(THEMES[k], THEME_DYN);
+  }catch(e){ lastErr=String(e&&e.message||e).slice(0,120); }
 }
 
 /* 启动模式：开机检测日期，跨天就换下一个主题 */
@@ -1860,7 +1936,8 @@ async function playStartup(){
   const t=THEMES[THEME];
   $("todayAnim").textContent=t.name;
   if(!await enterStreamMode()) return;
-  runTheme(t, true);                                // 入场一律跑动态，够热闹
+  if(FW_ANIM) await applyFirmwareTheme(t);          // 固件动画：入场也不持续推帧
+  else runTheme(t, true);                           // 入场一律跑动态，够热闹
   setTimeout(()=>{ if(MODE==="startup") setMode(LAST_RESIDENT); }, 12000);
 }
 $("playStartup").addEventListener("click", playStartup);
@@ -2036,6 +2113,16 @@ $("dynBtn").addEventListener("click", ()=>{
   THEME_DYN=!THEME_DYN; localStorage.setItem("yogo_dyn", THEME_DYN?"1":"0");
   syncDynBtn(); if(MODE==="theme") applyTheme(THEME); });
 syncDynBtn();
+
+/* 固件动画开关：点阵/背光交给键盘内置效果，主机不再持续推帧 */
+if($("fwAnim")){
+  $("fwAnim").checked=FW_ANIM;
+  $("fwAnim").addEventListener("change", ()=>{
+    FW_ANIM=$("fwAnim").checked;
+    localStorage.setItem("yogo_fwanim", FW_ANIM?"1":"0");
+    if(MODE==="theme") applyTheme(THEME);
+  });
+}
 
 /* 亮度滑杆 —— 软件缩放，拖动即时生效 */
 function repaintNow(){

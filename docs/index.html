@@ -346,7 +346,7 @@
   <section id="faq">
     <div class="sec-head"><h2>常见问题</h2></div>
     <div class="faq">
-      <details><summary>会不会弄坏键盘？</summary><p><b>不会。</b>不刷固件、不改按键。画面是实时发给键盘的，不存进键盘里；只有切换背光模式时会改一次键盘设置，跟官方驱动一样。想回到出厂状态，用官方 ATK HUB 的「恢复出厂」就行。</p></details>
+      <details><summary>会不会弄坏键盘？</summary><p><b>不会。</b>不刷固件、不改按键。点阵自定义图是实时发给键盘的，不存进键盘里；逐键配色会写进键盘的自定义灯效缓冲区（模式 253），切主题只写一次（VIA 缓冲区只在 USB 有线下开放，2.4G 下自动回退逐帧推流）。打开「固件动画」后，点阵和背光由键盘内置效果自己跑，主机不持续占用 2.4G。想回到出厂状态，用官方 ATK HUB 的「恢复出厂」就行。</p></details>
       <details><summary>蓝牙连接能用吗？</summary><p><b>不能。</b>键盘在蓝牙模式下不接受电脑控制灯光（键盘自己的限制）。要用 2.4G 接收器或数据线，打字、续航都不受影响。</p></details>
       <details><summary>要联网吗？</summary><p><b>不用。</b>默认完全离线。只有你手动打开给程序员用的「Claude 模式」，才会读取电脑上 Claude Code 的登录信息去查用量。</p></details>
       <details><summary>关掉软件会怎样？</summary><p>键盘上会留着最后一个画面，直到键盘休眠；之后回到键盘自带的显示。再打开软件会自动补上。</p></details>

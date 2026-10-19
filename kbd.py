@@ -26,6 +26,7 @@ import paths
 
 C_HAND, C_READ, C_WRITE, C_SYNCLED, C_ENDSYNC, C_MATRIX = 16, 20, 21, 46, 47, 59
 C_POWER = 48                 # 电量，从官方 HUB 的命令表里对出来的
+C_END_SYNC_DOT = 61          # 结束点阵同步会话（官方 begin/end 都先发它）
 # 同一张表里还有 C_RESET=49（恢复出厂）—— 记在这儿是为了永远别手滑发出去，
 # 也是为什么探测协议时绝对不能盲扫命令号。
 POWER_EVERY = 30.0           # 电量变化慢，没必要频繁占用 HID 通道
@@ -35,6 +36,21 @@ HAND_EVERY = 4.0             # 握手节流：4 秒内不重复
 REPLY_TIMEOUT = 0.9          # 等回包；2.4G 转发有延迟，键盘刚醒更慢
 REOPEN_EVERY = 2.0
 
+# ── VIA 自定义灯效缓冲区（官方 EVISION_V2 的 id_set_light_buffer 路径）──
+# 命令从官方 HUB 的 keymap 表里对出来：cmd 8/69 读、7/66 写、3/150/18 保存。
+# 走 FF60/61 厂商口，report id 75（EVISION 数据用 report id 0，两者靠 report id 分流）。
+VIA_UP, VIA_US = 0xFF60, 0x61
+VIA_SIZE = 32
+VIA_RID = 75                  # 官方 EVISION_V2 的 VIA 传输用 report id 0x4B
+VIA_RID_FALLBACK = 0
+VIA_GET_CUSTOM, VIA_GET_LAMPLIGHT = 8, 69
+VIA_SET_CUSTOM, VIA_SET_LAMPLIGHT = 7, 66
+VIA_SET_KBD, VIA_CUSTOM_ID, VIA_SAVE_LAMPLIGHT = 3, 150, 18
+VIA_COLS = 16                 # YOGO 75 PRO：6 行 × 16 列（含空位）
+VIA_ROWS = 6
+VIA_TIMEOUT_MS = 600
+DEBUG_RX = os.environ.get("YOGO_DEBUG_RX") == "1"
+
 # ── 推流防线 ──────────────────────────────────────────────────────
 # 上层（网页里的动画循环）出 bug 时会疯狂重推同一帧：轻则键盘灯乱闪，
 # 重则把 HID 通道塞爆，连按键都上报不上来（真发生过）。所以这一层必须兜底：
@@ -43,8 +59,8 @@ REOPEN_EVERY = 2.0
 # 上限比正常动画帧率高一点，正常动画不受影响，只挡异常。
 MIN_MATRIX_GAP = 0.16        # 点阵最快 ~6fps（36 个点，便宜）
 MIN_KEYS_GAP = 0.5           # 键盘灯最快 2fps（84 颗灯，耗电大头，砍最狠）
-SAME_MATRIX_HOLD = 600.0     # 画面没变：十分钟补推一次保活就够（图在设备里不会自己丢）
-SAME_KEYS_HOLD = 900.0       # 键盘灯静态画面：十五分钟一次
+SAME_MATRIX_HOLD = 1800.0    # 画面没变：半小时补推一次保活就够（图在设备里不会自己丢）
+SAME_KEYS_HOLD = 3600.0      # 键盘灯静态画面：一小时一次
 PACKET_GAP = 0.003           # 同一帧内包与包之间留一点空，别把 2.4G 链路的按键上报挤掉
 TYPING_GUARD = True          # 最近有键鼠输入时，非必要的画面先让路
 TYPING_GUARD_MS = 250
@@ -124,6 +140,183 @@ def recent_key_input(ms=None):
     return recent_input(ms)
 
 
+class ViaLink:
+    """FF00/01 boot 接口上的 VIA 小通道，只用来读写自定义灯效缓冲区。
+
+    官方 EVISION_V2 控制器用 VIA 的 get/set_light_buffer 把整张逐键 RGB 矩阵
+    写进键盘；写一次之后切到 blMode=253，背光就不需要 cmd 46 逐帧推流了。
+    这里只发读、写、保存三个命令，绝不碰 reset/OTP。
+    """
+
+    def __init__(self, transport=None):
+        self.fh = None
+        self.in_len = self.out_len = 33
+        self.lock = threading.RLock()
+        self.err = ""
+        self.ok = None                 # None=没试过，True/False=探测结果
+        self.rid_used = None           # 探测成功后记住能用的 report id
+        self.pid = None                # 备用路径：只开和键盘同一个 PID 的 VIA 口
+        self.transport = transport     # 主路径：复用键盘句柄，回包走 _read_loop
+
+    def close(self):
+        with self.lock:
+            fh, self.fh = self.fh, None
+            if fh is not None:
+                try:
+                    H.k32.CloseHandle(fh)
+                except Exception:
+                    pass
+
+    def _open(self):
+        if self.fh is not None:
+            return True
+        try:
+            rows = [r for r in H.interfaces()
+                    if r[1] == H.VID and r[3] == VIA_UP and r[4] == VIA_US
+                    and (self.pid is None or r[2] == self.pid)]
+        except Exception as e:
+            self.err = "VIA 枚举失败：%s" % e
+            return False
+        if not rows:
+            self.err = "没找到 VIA 接口"
+            return False
+        path, vid, pid, up, us, il, ol = rows[0]
+        fh = H.k32.CreateFileW(path, H.GENERIC_READ | H.GENERIC_WRITE,
+                               H.FILE_SHARE_READ | H.FILE_SHARE_WRITE, None,
+                               H.OPEN_EXISTING, H.FILE_FLAG_OVERLAPPED, None)
+        if fh == H.INVALID_HANDLE:
+            self.err = "VIA 打不开：%d" % ctypes.get_last_error()
+            return False
+        H.hid.HidD_SetNumInputBuffers(fh, 64)
+        self.fh = fh
+        self.in_len, self.out_len = il or 64, ol or 64
+        self.err = ""
+        return True
+
+    def _transact(self, pkt):
+        """发一个 32 字节 VIA 包并等回包。失败返回 None。"""
+        if self.transport is not None:
+            return self.transport(pkt)     # 复用键盘句柄，回包由 _read_loop 投递
+        with self.lock:
+            if not self._open():
+                return None
+            body = bytes(pkt[:VIA_SIZE]).ljust(VIA_SIZE, NUL)
+            first = self.rid_used if self.rid_used is not None else VIA_RID
+            rids = [first] + [x for x in (VIA_RID, VIA_RID_FALLBACK) if x != first]
+            for rid in rids:
+                data = (bytes([rid]) + body)[:self.out_len].ljust(self.out_len, NUL)
+                r = self._transact_once(data)
+                if r is not None:
+                    self.rid_used = rid
+                    self.err = ""
+                    return r
+            return None
+
+    def _transact_once(self, data):
+        ev = H.k32.CreateEventW(None, True, False, None)
+        if not ev:
+            self.err = "VIA 建事件失败"
+            return None
+        try:
+            ov = H.OVERLAPPED()
+            ov.hEvent = ev
+            H.k32.ResetEvent(ev)
+            wbuf = (ctypes.c_ubyte * len(data))(*data)
+            ok = H.k32.WriteFile(self.fh, wbuf, len(data), None, ctypes.byref(ov))
+            if not ok and ctypes.get_last_error() != H.ERROR_IO_PENDING:
+                self.err = "VIA 写失败：%d" % ctypes.get_last_error()
+                return None
+            if H.k32.WaitForSingleObject(ev, 800) != H.WAIT_OBJECT_0:
+                H.k32.CancelIoEx(self.fh, ctypes.byref(ov))
+                self.err = "VIA 写超时"
+                return None
+            buf = (ctypes.c_ubyte * self.in_len)()
+            ov2 = H.OVERLAPPED()
+            ov2.hEvent = ev
+            H.k32.ResetEvent(ev)
+            ok = H.k32.ReadFile(self.fh, buf, self.in_len, None, ctypes.byref(ov2))
+            if not ok and ctypes.get_last_error() != H.ERROR_IO_PENDING:
+                self.err = "VIA 读失败：%d" % ctypes.get_last_error()
+                return None
+            if H.k32.WaitForSingleObject(ev, VIA_TIMEOUT_MS) != H.WAIT_OBJECT_0:
+                H.k32.CancelIoEx(self.fh, ctypes.byref(ov2))
+                self.err = "VIA 读超时"
+                return None
+            n = wt.DWORD()
+            H.k32.GetOverlappedResult(self.fh, ctypes.byref(ov2), ctypes.byref(n), False)
+            return bytes(buf[:n.value])
+        finally:
+            H.k32.CloseHandle(ev)
+
+    @staticmethod
+    def _strip(resp, cmd):
+        if resp and len(resp) > 1 and resp[0] in (VIA_RID_FALLBACK, VIA_RID) \
+                and resp[1] == cmd:
+            return resp[1:]            # 某些驱动会把 report id 留在缓冲里
+        return resp
+
+    def read_chunk(self, row, col, num):
+        r = self._transact(bytes([VIA_GET_CUSTOM, VIA_GET_LAMPLIGHT,
+                                  row & 255, col & 255, num & 255]))
+        r = self._strip(r, VIA_GET_CUSTOM)
+        if not r or len(r) < 5 + num * 3 or r[0] != VIA_GET_CUSTOM \
+                or r[1] != VIA_GET_LAMPLIGHT:
+            if r:
+                self.err = "VIA 回包不匹配：%s" % r[:8].hex(" ")
+            return None
+        return r[5:5 + num * 3]
+
+    def write_chunk(self, row, col, num, colors):
+        pkt = bytes([VIA_SET_CUSTOM, VIA_SET_LAMPLIGHT,
+                     row & 255, col & 255, num & 255]) + bytes(colors)
+        r = self._transact(pkt)
+        r = self._strip(r, VIA_SET_CUSTOM)
+        if not r:
+            return False
+        return r[0] in (VIA_SET_CUSTOM, VIA_SET_LAMPLIGHT)
+
+    def save(self):
+        r = self._transact(bytes([VIA_SET_KBD, VIA_CUSTOM_ID, VIA_SAVE_LAMPLIGHT]))
+        r = self._strip(r, VIA_SET_KBD)
+        return bool(r) and r[0] == VIA_SET_KBD
+
+    def read_led(self, rows=VIA_ROWS, cols=VIA_COLS):
+        with self.lock:
+            out = []
+            for r in range(rows):
+                line = []
+                for c in range(0, cols, 8):
+                    n = min(8, cols - c)
+                    chunk = self.read_chunk(r, c, n)
+                    if chunk is None:
+                        self.ok = False
+                        return None
+                    line.extend([list(chunk[i:i + 3]) for i in range(0, n * 3, 3)])
+                out.append(line)
+            self.ok = True
+            return out
+
+    def write_led(self, colors, rows=VIA_ROWS, cols=VIA_COLS):
+        with self.lock:
+            for r in range(rows):
+                line = colors[r] if r < len(colors) else []
+                for c in range(0, cols, 8):
+                    n = min(8, cols - c)
+                    chunk = []
+                    for i in range(n):
+                        rgb = line[c + i] if c + i < len(line) else [0, 0, 0]
+                        rgb = list(rgb) + [0, 0, 0]
+                        chunk.extend([int(x) & 255 for x in rgb[:3]])
+                    if not self.write_chunk(r, c, n, chunk):
+                        self.ok = False
+                        return False
+            if not self.save():
+                self.ok = False
+                return False
+            self.ok = True
+            return True
+
+
 class Keyboard:
     def __init__(self):
         self.fh = None
@@ -154,6 +347,12 @@ class Keyboard:
         self._mx_off = self._ky_off = False           # 点阵 / 键盘灯此刻是否被我们熄了
         self._saved_mx = self._saved_ky = None        # 熄着时上层最新想显示的画面
         self._idler = None
+        self.via_event = threading.Event()
+        self.via_reply = None
+        self.via_rid_used = None
+        self.via = ViaLink(self.via_transact)         # FF60 上的自定义灯效缓冲区
+        self._last_cfg = None                         # 最近一次读到的 64 字节配置
+        self._anim = None                             # 原生帧序列播放器
 
     # ── 打开 / 关闭 ────────────────────────────────────────────────
     def connected(self):
@@ -181,8 +380,11 @@ class Keyboard:
         # 接收器报的产品名带 Dongle，键盘直连（插线）报的不带 —— 用这个分辨
         # 走的是哪条路。有线基本就等于在充电，是判断充电状态的主要依据。
         wired = "dongle" not in (self.product or "").lower()
-        if wired != self.wired:             # 换了路：上一条路的电量读数作废
+        if wired != self.wired:             # 换了路：上一条路的电量和 VIA 能力都作废
             self._pw, self._pw_t = None, 0.0
+            self.via.ok = None
+            self.via.rid_used = None
+            self.via.err = ""
         self.wired = wired
         self.err = ""
         self.running = True
@@ -223,6 +425,7 @@ class Keyboard:
         rows.sort(key=lambda r: r[0] != self.path)     # 上次能用的口先试
         spare = None
         for path, vid, pid, up, us, il, ol in rows:
+            self.via.pid = pid
             if not self._try_path(path, il, ol):
                 continue
             if self.ping():
@@ -241,6 +444,8 @@ class Keyboard:
 
     def close(self):
         self.running = False
+        self.stop_frames()
+        self.via.close()
         fh, self.fh = self.fh, None
         if fh is not None:
             try:
@@ -275,6 +480,20 @@ class Keyboard:
                     continue
                 H.k32.GetOverlappedResult(fh, ctypes.byref(ov), ctypes.byref(n), False)
                 data = bytes(buf[:n.value])
+                if DEBUG_RX:
+                    print("[rx] %s" % data.hex(" "), flush=True)
+                if len(data) >= 2:
+                    if data[0] == VIA_RID or (
+                            data[0] == VIA_RID_FALLBACK
+                            and data[1] in (VIA_GET_CUSTOM, VIA_SET_CUSTOM, VIA_SET_KBD)):
+                        self.via_reply = data
+                        self.via_event.set()
+                        continue
+                    if data[0] in (VIA_GET_CUSTOM, VIA_SET_CUSTOM, VIA_SET_KBD) \
+                            and data[1] in (VIA_GET_LAMPLIGHT, VIA_SET_LAMPLIGHT, VIA_CUSTOM_ID):
+                        self.via_reply = data          # 驱动把 report id 去掉了
+                        self.via_event.set()
+                        continue
                 if len(data) >= 7:
                     slot = self.pending.get(data[6])
                     if slot:
@@ -396,6 +615,7 @@ class Keyboard:
                 if ok:
                     self.awake = True
                     self.err = ""
+                    self._last_cfg = bytes(cfg)
                     self._backup(bytes(cfg))
                     return bytes(cfg)
         self.awake = False
@@ -430,6 +650,7 @@ class Keyboard:
             self.send(C_ENDSYNC, 0, b"", 0)
             for off, ln in ((0, 24), (24, 24), (48, 16)):
                 self.send(C_WRITE, off, bytes(cfg[off:off + ln]))
+            self._last_cfg = bytes(cfg)
 
     def patch_config(self, patch):
         """读-改-写：patch 是 {字节偏移: 值}，只动指定字节。"""
@@ -438,6 +659,7 @@ class Keyboard:
             for k, v in patch.items():
                 cfg[int(k)] = max(0, min(255, int(v)))
             self.write_config(cfg)
+            self._last_cfg = bytes(cfg)
             return bytes(cfg)
 
     # ── 省电闸门 ───────────────────────────────────────────────────
@@ -649,11 +871,131 @@ class Keyboard:
         self.send(C_ENDSYNC, 0, b"", 0, wait=False)
         self.forget_keys()
 
+    # ── 点阵屏模式 / 会话语义 ─────────────────────────────────────
+    def end_sync_dot(self):
+        """结束点阵同步会话。官方在进入/退出自定义点阵前都会发一次。"""
+        self.send(C_END_SYNC_DOT, 0, b"", 0, wait=False)
+
+    def set_dot_mode(self, mode, brightness=None, speed=None, colorful=None,
+                     color_index=None, color=None, sync=True):
+        """mode: 0-12 内置效果，6=自定义推帧；speed 是 0-6 的 UI 值。"""
+        if sync:
+            try:
+                self.end_sync_dot()
+                time.sleep(0.05)
+            except Exception:
+                pass
+        patch = {29: 0, 30: int(mode) & 255}   # 29=LedTFTOnOff，官方设 0 表示启用
+        if brightness is not None:
+            patch[31] = max(0, min(255, int(brightness)))
+        if speed is not None:
+            patch[32] = max(0, min(6, 6 - int(speed)))
+        if colorful is not None:
+            patch[33] = 1 if colorful else 0
+        if color_index is not None:
+            patch[34] = max(0, min(255, int(color_index)))
+        if color is not None:
+            rgb = list(color) + [0, 0, 0]
+            patch[35], patch[36], patch[37] = [max(0, min(255, int(x))) for x in rgb[:3]]
+        cfg = self.patch_config(patch)
+        self._last_cfg = bytes(cfg)
+        return cfg
+
+    def dot_config(self):
+        if self._last_cfg is None:
+            self.read_config()
+        c = self._last_cfg
+        if not c:
+            return {}
+        return {"mode": c[30], "brightness": c[31],
+                "speed": max(0, min(6, 6 - c[32])), "colorful": c[33],
+                "colorIndex": c[34], "color": [c[35], c[36], c[37]]}
+
+    # ── VIA 事务（复用 FF60 句柄，report id 75 / 回退 0）─────────────
+    def via_transact(self, pkt):
+        with self.lock:
+            if self.fh is None and not self.open():
+                return None
+            rid = self.via_rid_used if self.via_rid_used is not None else VIA_RID
+            rids = [rid] + [x for x in (VIA_RID, VIA_RID_FALLBACK) if x != rid]
+            for r in rids:
+                self.via_reply = None
+                self.via_event.clear()
+                data = (bytes([r]) + bytes(pkt[:VIA_SIZE]).ljust(VIA_SIZE, NUL))
+                data = data[:self.out_len].ljust(self.out_len, NUL)
+                if DEBUG_RX:
+                    print("[via tx] rid=%d %s" % (r, data[:8].hex(" ")), flush=True)
+                if not self._write(data):
+                    continue
+                if self.via_event.wait(VIA_TIMEOUT_MS / 1000.0):
+                    self.via_rid_used = r
+                    if DEBUG_RX:
+                        print("[via rx] %s" % self.via_reply.hex(" "), flush=True)
+                    return self.via_reply
+            self.via.err = "VIA 读超时"
+            return None
+
+    # ── 自定义逐键灯效缓冲区（写一次，设备自己显示）────────────────
+    def read_custom_led(self):
+        return self.via.read_led()
+
+    def write_custom_led(self, colors):
+        """colors: 6×16 RGB。成功返回 True；失败时调用方回退到 cmd 46。"""
+        # 已知这条连接不支持 VIA（例如 2.4G 接收器）：直接回退，别再等超时
+        if self.via.ok is False:
+            return False
+        # 先读一次确认 VIA 通道真的通，再写；避免在错误的报告格式上盲写
+        if self.via.ok is None and self.via.read_led() is None:
+            return False
+        if not self.via.write_led(colors):
+            return False
+        try:
+            self.patch_config({2: 253})       # 253 = 自定义灯效缓冲区
+        except Exception:
+            return False
+        self.forget_keys()
+        self._keys_last = None
+        return True
+
+    # ── 原生帧序列播放器（单帧/多帧都走这里，统一串行）────────────
+    def play_frames(self, frames, fps=6, loop=True):
+        frames = [bytes(f)[:108].ljust(108, NUL) for f in (frames or []) if f]
+        self.stop_frames()
+        if not frames:
+            return False
+        anim = {"frames": frames, "fps": max(1.0, min(6.0, float(fps))),
+                "loop": bool(loop), "stop": False}
+        self._anim = anim
+        threading.Thread(target=self._anim_loop, args=(anim,), daemon=True).start()
+        return True
+
+    def stop_frames(self):
+        a, self._anim = self._anim, None
+        if a:
+            a["stop"] = True
+
+    def _anim_loop(self, a):
+        i, nxt = 0, time.time()
+        while not a["stop"] and self._anim is a:
+            try:
+                self.push_matrix(a["frames"][i])
+            except Exception:
+                break
+            i += 1
+            if i >= len(a["frames"]):
+                if not a["loop"]:
+                    break
+                i = 0
+            nxt += 1.0 / a["fps"]
+            time.sleep(max(0.0, nxt - time.time()))
+
     def status(self):
         return {"connected": self.connected(), "awake": self.awake,
                 "product": self.product, "err": self.err, "dropped": self.dropped,
                 "wired": self.wired, "power": self._pw,
-                "blanked": self.blanked, "idle": round(idle_secs()), "locked": self.locked}
+                "blanked": self.blanked, "idle": round(idle_secs()), "locked": self.locked,
+                "via": self.via.ok, "via_err": self.via.err, "anim": bool(self._anim),
+                "dot": self.dot_config() if self._last_cfg is not None else None}
 
 
 KB = Keyboard()

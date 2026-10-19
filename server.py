@@ -341,6 +341,31 @@ def kb_api(path, d):
             if 2 in patch and patch[2] != 254:   # 背光交回固件：推流那帧灯作废
                 kb.forget_keys()
             return {"ok": True, "awake": True, "cfg": list(cfg)}
+        if path == "/kb/dotmode":
+            cfg = kb.set_dot_mode(
+                int(d.get("mode", 6)),
+                brightness=d.get("brightness"),
+                speed=d.get("speed"),
+                colorful=d.get("colorful"),
+                color_index=d.get("colorIndex", d.get("color_index")),
+                color=d.get("color"),
+                sync=bool(d.get("sync", True)))
+            return {"ok": True, "awake": True, "cfg": list(cfg), "dot": kb.dot_config()}
+        if path == "/kb/lightbuf":
+            if "colors" in d:
+                ok = kb.write_custom_led(d.get("colors") or [])
+                return {"ok": ok, "awake": kb.awake, "via": kb.via.ok,
+                        "why": None if ok else (kb.via.err or "VIA 写不进去")}
+            colors = kb.read_custom_led()
+            return {"ok": colors is not None, "colors": colors, "via": kb.via.ok,
+                    "why": None if colors is not None else (kb.via.err or "VIA 读不到")}
+        if path == "/kb/anim":
+            ok = kb.play_frames(d.get("frames") or [], d.get("fps", 6),
+                                d.get("loop", True))
+            return {"ok": ok, "anim": bool(kb._anim)}
+        if path == "/kb/anim/stop":
+            kb.stop_frames()
+            return {"ok": True}
         if path == "/kb/matrix":
             kb.push_matrix(bytes(int(v) & 255 for v in (d.get("rgb") or [])),
                            force=bool(d.get("force")))
@@ -368,7 +393,7 @@ def kb_api(path, d):
 class UI(Base):
     def do_GET(self):
         p = self.path.split("?")[0]
-        if p in ("/kb/status", "/kb/power"):
+        if p in ("/kb/status", "/kb/power", "/kb/lightbuf"):
             return self._json(kb_api(p, {}))
         if p == "/debug":
             with _lock:
