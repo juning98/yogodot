@@ -37,6 +37,7 @@
 - **24 套主题**:一张小屏图案 + 一套 84 键配色,成套切换。颜色按这把键盘的灯珠调过,不会发白
 - **会动的主题**:小屏和背光一起动(为了省电,刷新得比较慢)
 - **番茄钟**:小屏画一圈进度,到点背光闪一下提醒
+- **Coding 伴侣**:Claude Code / Codex / TRAE / OpenCode 的任务状态上小屏,形状认工具、颜色认状态;键盘保持当前灯效,只有小屏动
 - **专注模式**:一键全灭
 - **省电**:Win+L 锁屏几秒内全灭、离开 3 分钟自动熄;电量低于 20% 关背光,低于 8% 小屏也关,插上电自动恢复
 - **电量**:软件里直接显示电量和是否在充电
@@ -107,6 +108,22 @@
 
 hook 全部是 `async`、永远 `exit 0`,只往服务器本地文件追加一行,不参与任何权限决策,不会拖慢 Claude。
 
+## Coding 伴侣(Claude Code / Codex / TRAE / OpenCode)
+
+顶栏选「Coding 伴侣」,6×6 小屏用**形状认工具、颜色认状态**:
+
+- 形状:Claude Code = 方块螃蟹,Codex = 圆角云 + `>_`,OpenCode = 竖门,TRAE = 带眼洞的脸
+- 颜色:白 = 空闲,蓝 = 执行中,琥珀 = 等你授权,紫 = 等你补充,绿 = 完成,红 = 出错
+- 键盘保持当前灯效不变;只有小屏按 8 帧/秒动;伴侣面板里可以单独换键盘灯效
+- 完成 / 出错演 6 秒后退回白色空闲
+- 等你授权和等你补充同级,最近的优先;其余按 出错 > 执行中 > 完成 > 空闲
+- 控制台里的「模拟四家工具」可以先用假事件看完整灯语,再接真实工具
+
+事件统一走本机 `POST /events`,适配器和安装说明在
+[remote/companion/README.md](remote/companion/README.md)。适配器只发送状态元数据,
+**不提取、不发送** prompt、模型回答、工具输入输出;服务端 `session_ended` 主动清会话,也可以手动清空。
+不开 Claude 模式也能用 Coding 伴侣;胶囊和额度仍然只属于 Claude 模式。
+
 ## 开发者
 
 ### 从源码运行
@@ -142,7 +159,7 @@ pip install -r requirements.txt
 
 ## English
 
-YogoDot controls the 6×6 pixel screen and per-key RGB backlight of the **ATK YOGO 75 PRO** keyboard — an alternative to the official ATK HUB driver. 48 pixel-art images, 24 themes (backlight + screen), animations, pomodoro, auto-off on lock / idle / low battery, battery display. Windows only, no install: [download the zip](https://github.com/Wednesque/yogodot/releases/latest/download/YogoDot-windows.zip), unzip, run `YogoDot.exe`. Works over the 2.4G dongle or USB cable, not Bluetooth (firmware limitation). Offline by default; the optional "Claude mode" shows Claude Code usage and session state on a desktop capsule and as a pet on the screen.
+YogoDot controls the 6×6 pixel screen and per-key RGB backlight of the **ATK YOGO 75 PRO** keyboard — an alternative to the official ATK HUB driver. 48 pixel-art images, 24 themes (backlight + screen), animations, pomodoro, auto-off on lock / idle / low battery, battery display. Windows only, no install: [download the zip](https://github.com/Wednesque/yogodot/releases/latest/download/YogoDot-windows.zip), unzip, run `YogoDot.exe`. Works over the 2.4G dongle or USB cable, not Bluetooth (firmware limitation). Offline by default; the optional "Claude mode" shows Claude Code usage and session state on a desktop capsule, and the **Coding companion** mode turns the screen into a tool/state light for Claude Code, Codex, TRAE and OpenCode (shape = tool, color = state, keyboard stays on the current theme).
 
 ## 许可
 
