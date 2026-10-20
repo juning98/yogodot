@@ -413,6 +413,11 @@
           <select id="cKbFx"></select>
           <span style="color:var(--dim2);font-size:12px">只换键盘，小屏不动</span>
         </div>
+        <div class="row" style="margin:0 0 14px">
+          <span style="color:var(--dim2);font-size:12.5px">空闲展示</span>
+          <select id="cIdleLook"></select>
+          <span style="color:var(--dim2);font-size:12px">只在空闲时生效，忙时仍显示真实工具</span>
+        </div>
         <div id="cTop" class="agent"></div>
         <div id="cSessions" style="margin-top:10px"></div>
         <p class="label" style="margin-top:22px">形状与状态</p>
@@ -2694,14 +2699,43 @@ function vibePaint(){
    形状认工具、颜色认状态。小屏是唯一会动的东西 —— 进入模式时把当前主题的
    键盘灯推一次，之后只推 6×6。空闲白色；wait/ask 同级取最近；done/error
    演 6 秒后退回白色空闲。 */
-const COMP_COL={ busy:[74,127,243], wait:[255,176,32], ask:[124,92,255],
-                 done:[53,199,138], error:[255,59,48] };
+/* 点阵灯珠的蓝通道效率远高于绿/红（约 14:4:1）：低饱和色会被蓝压成青或紫。
+   所以状态色按「目标色相 + 非蓝状态尽量不给蓝」来配：
+   橙/绿/红把 B 压到 0，紫用高红 + 一点点蓝，才不会看成进行中的蓝。 */
+const COMP_COL={ busy:[0,90,255], wait:[255,60,0], ask:[230,0,35],
+                 done:[0,220,0], error:[255,0,0] };
 const COMP_LABEL={ "claude-code":"Claude Code", codex:"Codex", opencode:"OpenCode",
                    trae:"TRAE", mcp:"MCP", companion:"Coding 伴侣" };
 const COMP_TOOLS=[["claude-code","Claude Code"],["codex","Codex"],
                   ["opencode","OpenCode"],["trae","TRAE"]];
 const COMP_STATES=[["idle","空闲 · 白"],["busy","执行中 · 蓝"],["wait","等你 · 琥珀"],
                    ["ask","补充 · 紫"],["done","完成 · 绿"],["error","出错 · 红"]];
+/* 空闲展示：只在状态为 idle 时生效；忙/等/完成/出错仍然显示真实工具。
+   原来 OpenCode 门内四套动作自动轮换，实际不容易看出来，改成手动选。 */
+const IDLE_LOOKS=[
+  ["auto","跟随会话"],
+  ["claude-code","Claude Code · 眨眼"],
+  ["codex","Codex · 光标闪"],
+  ["opencode:scan","OpenCode · 扫描线"],
+  ["opencode:door","OpenCode · 门开合"],
+  ["opencode:stream","OpenCode · 数据流"],
+  ["opencode:beat","OpenCode · 心跳"],
+  ["trae","TRAE · 眨眼"]
+];
+let IDLE_LOOK=localStorage.getItem("yogo_idle_look")||"auto";
+(function(){
+  const sel=$("cIdleLook"); if(!sel) return;
+  if(!IDLE_LOOKS.some(([v])=>v===IDLE_LOOK)) IDLE_LOOK="auto";
+  for(const [v,t] of IDLE_LOOKS){
+    const o=document.createElement("option"); o.value=v; o.textContent=t; sel.appendChild(o);
+  }
+  sel.value=IDLE_LOOK;
+  sel.addEventListener("change",()=>{
+    IDLE_LOOK=sel.value;
+    localStorage.setItem("yogo_idle_look",IDLE_LOOK);
+    compSig=null; companionPaint(); renderCompanionList();
+  });
+})();
 const COMP_ROWS={
   claude:[".e..e.",".b..b.","bbbbbb","bbbbbb",".b..b.","b....b"],
   codex:[".bbbb.","bbbbbb","bbpbbb","bbbpbb","bbpbpb",".bbbb."],
@@ -2742,8 +2776,89 @@ function compRipple(r,c,t){
   const d=Math.hypot((r-2.5)/2.6,(c-2.5)/2.6);
   return Math.pow(Math.max(0,Math.cos((d*1.5-t*2.6)*Math.PI)),8)*Math.exp(-t*.8);
 }
-function companionFrame(agent,state,t){
+/* 空闲：白色不变，每家工具一个很小的动作，4 帧/秒。
+   低亮度白色不会抢状态色；离开 3 分钟仍然由 kbd 层整体熄屏。 */
+function idleFrame(agent,t,look){
+  const g=blank();
+  const W=[255,255,255];
+  const br=.46+.09*Math.sin(t*1.15);            // 慢呼吸
+  const put=(r,c,b)=>compPut(g,r,c,W,b);
+  const blink=(period,width,off)=>((((t+(off||0))%period)+period)%period)<width;
+
+  if(agent==="claude-code"){
+    const body=compCells(COMP_ROWS.claude,"b");
+    const eyes=compCells(COMP_ROWS.claude,"e");
+    const shut=blink(6.2,.30,3.6);
+    for(const [r,c] of body) put(r,c,br);
+    for(const [r,c] of eyes) put(r,c,shut?br:0);   // 眨眼时眼睛被白色填平
+    const wave=.05*Math.sin(t*1.7);
+    put(5,0,Math.max(0,br+wave));                   // 两只钳子轻轻交替
+    put(5,5,Math.max(0,br-wave));
+    return g;
+  }
+  if(agent==="codex"){
+    const body=compCells(COMP_ROWS.codex,"b");
+    const prompt=compCells(COMP_ROWS.codex,"p");
+    const cursor=blink(1.25,.34,.6);
+    for(const [r,c] of body) put(r,c,br);
+    for(const [r,c] of prompt) put(r,c,cursor?br:0); // >_ 像终端光标那样闪
+    return g;
+  }
+  if(agent==="opencode"){
+    for(const [r,c] of COMP_FRAME) put(r,c,br);
+    const fade=Math.min(1,t/.55);
+    const ip=(r,c,b)=>put(r,c,Math.max(0,b*fade));
+    const mode=look||"scan";
+    if(mode==="door"){
+      const open=.5+.5*Math.sin(t*.9);
+      const half=open>.55?1:0;
+      for(let r=1;r<5;r++) for(let c=2-half;c<=3+half;c++) ip(r,c,.10+.12*open);
+    } else if(mode==="stream"){
+      for(let i=0;i<3;i++){
+        const row=1+Math.floor((t*(1.0+i*.3)+i*1.7)%4);
+        const col=[1,3,4][i];
+        ip(row,col,.45);
+        if(row>1) ip(row-1,col,.16);
+      }
+    } else if(mode==="beat"){
+      const ph=t%4;
+      const beat=Math.exp(-Math.pow((ph-.2)/.12,2))
+               + .7*Math.exp(-Math.pow((ph-.5)/.12,2));
+      const b=.10+.55*Math.min(1,beat);
+      for(const [r,c] of [[2,2],[2,3],[3,2],[3,3]]) ip(r,c,b);
+    } else {
+      const sweep=2.3, ph=t%3.2;
+      if(ph<sweep){
+        const head=1+Math.min(3,Math.floor(ph/sweep*4));
+        [.55,.30,.14].forEach((b,d)=>{
+          const r=head-d;
+          if(r>=1&&r<=4) for(let c=1;c<5;c++) ip(r,c,b);
+        });
+      }
+    }
+    return g;
+  }
+  if(agent==="trae"){
+    const holes=new Set(COMP_TRAE_HOLES.map(([r,c])=>r+","+c));
+    const shut=blink(5.6,.30,2.8);
+    for(let r=0;r<6;r++)for(let c=0;c<6;c++){
+      const eye=(r===1||r===2)&&(c===1||c===4);
+      if(holes.has(r+","+c)){ put(r,c,eye&&shut?br:0); continue; }
+      put(r,c,br);
+    }
+    return g;
+  }
+  const body=compCells(COMP_ROWS.generic,"b");
+  const prompt=compCells(COMP_ROWS.generic,"p");
+  const cursor=blink(1.25,.34,.6);
+  for(const [r,c] of body) put(r,c,br);
+  for(const [r,c] of prompt) put(r,c,cursor?br:0);
+  return g;
+}
+
+function companionFrame(agent,state,t,idleLook){
   t=t||0;
+  if(state==="idle") return idleFrame(agent,t,idleLook);
   const g=blank();
   const idle=state==="idle";
   const base=idle?[255,255,255]:(COMP_COL[state]||[255,255,255]);
@@ -2918,22 +3033,21 @@ function companionPaint(){
   const f=compFocus();
   const st=f.state||"idle";
   const agent=f.agent||"companion";
-  const sig=[agent,st,f.sessionId||f.key||"",THEME].join("|");
+  const idleOn=st==="idle"&&IDLE_LOOK!=="auto";
+  const drawAgent=idleOn?IDLE_LOOK.split(":")[0]:agent;
+  const drawLook=idleOn?(IDLE_LOOK.split(":")[1]||""):"";
+  const sig=[drawAgent,st,f.sessionId||f.key||"",THEME,st==="idle"?IDLE_LOOK:""].join("|");
   if(sig===compSig){ scheduleCompHold(); return; }
   if(compStop){compStop();compStop=null;}
   if(compHoldTimer){clearTimeout(compHoldTimer);compHoldTimer=null;}
   compSig=sig;
   renderCompanionTop();
-  if(st==="idle"){
-    pushMatrix(companionFrame(agent,st,0), true).catch(()=>{});
-    scheduleCompHold();
-    return;
-  }
-  const fps=8;
+  const fps=st==="idle"?4:8;
   let stopped=false,busy=false; const t0=performance.now();
   const tick=async()=>{ if(stopped)return;
+    if(MODE!=="companion"||!dev){ stopped=true; return; }
     if(!busy){ busy=true;
-      try{ await pushMatrix(companionFrame(agent,st,(performance.now()-t0)/1000)); }catch(e){}
+      try{ await pushMatrix(companionFrame(drawAgent,st,(performance.now()-t0)/1000,drawLook)); }catch(e){}
       busy=false; }
     if(!stopped) setTimeout(tick,1000/fps); };
   tick();
@@ -2946,10 +3060,12 @@ function renderCompanionTop(){
   const f=compFocus();
   const st=f.state||"idle";
   const agent=f.agent||"companion";
-  const label=compAgentLabel(agent);
+  const shown=(st==="idle"&&IDLE_LOOK!=="auto")?IDLE_LOOK.split(":")[0]:agent;
+  const label=compAgentLabel(shown);
   const name=f.name||f.project||f.key||"";
   const msg=f.msg||"";
   const pending=f.pending?("待处理 "+f.pending):"";
+  const idleNote=(st==="idle"&&IDLE_LOOK!=="auto")?"空闲展示":"";
   const hold=(f.until||st==="done"||st==="error") && st!=="idle";
   box.innerHTML=
     '<div class="st"><span class="dot" style="color:'+ST_CSS[st]+';background:currentColor"></span>'+
@@ -2957,9 +3073,9 @@ function renderCompanionTop(){
     '<span class="pill" style="color:'+ST_CSS[st]+'">'+esc(ST_TXT[st]||st)+'</span>'+
     (hold?'<span style="font-size:11.5px;color:var(--dim2);font-weight:400">演完退回空闲</span>':'')+
     '</div><div class="meta">'+
-    [name&&esc(name),msg&&esc(String(msg).slice(0,100)),pending&&esc(pending)]
+    [name&&esc(name),idleNote&&esc(idleNote),msg&&esc(String(msg).slice(0,100)),pending&&esc(pending)]
       .filter(Boolean).join("   ·   ")+
-    (name||msg||pending?'':'等第一条标准事件，或点上面的模拟按钮。')+'</div>';
+    (name||idleNote||msg||pending?'':'等第一条标准事件，或点上面的模拟按钮。')+'</div>';
 }
 function renderCompanionList(){
   const box=$("cSessions"); if(!box) return;
