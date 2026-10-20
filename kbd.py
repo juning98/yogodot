@@ -70,6 +70,7 @@ BATT_ALL_OFF = 8             # 低于这个：连点阵也停，把电留给打�
 # 最后一帧会一直留在屏上。所以省电必须主动熄屏：人离开键盘一段时间就全灭，
 # 回来再把画面推回去。键盘自己的休眠是 900 秒，我们比它早一步。
 IDLE_BLANK_S = 180.0         # 三分钟没碰键鼠：熄屏（锁屏则立刻）
+OFF_REBLANK_S = 15.0         # 熄着的时候定期补一帧全黑：固件可能自己把存储画面重画回来
 
 
 class LASTINPUTINFO(ctypes.Structure):
@@ -104,7 +105,8 @@ def idle_secs():
     li = LASTINPUTINFO()
     li.cbSize = ctypes.sizeof(li)
     if not _u32.GetLastInputInfo(ctypes.byref(li)):
-        return 0.0
+        # 查不到就当成「已经离开」：宁可多熄一次，也别因为一次查询失败整夜亮着。
+        return float(IDLE_BLANK_S)
     now = _k32.GetTickCount64() & 0xFFFFFFFF
     d = (now - li.dwTime) & 0xFFFFFFFF
     return d / 1000.0
@@ -346,6 +348,8 @@ class Keyboard:
         self.session_locked = None                    # 系统 WTS 通知给的权威值（None=还没收到过）
         self._mx_off = self._ky_off = False           # 点阵 / 键盘灯此刻是否被我们熄了
         self._saved_mx = self._saved_ky = None        # 熄着时上层最新想显示的画面
+        self._off_reblank = 0                         # 熄屏期间补黑帧的次数（排查用）
+        self._off_log_t = 0.0
         self._idler = None
         self.via_event = threading.Event()
         self.via_reply = None
@@ -651,6 +655,7 @@ class Keyboard:
             for off, ln in ((0, 24), (24, 24), (48, 16)):
                 self.send(C_WRITE, off, bytes(cfg[off:off + ln]))
             self._last_cfg = bytes(cfg)
+            self._reblank_mx()          # 写配置可能让固件把点阵重新点亮
 
     def patch_config(self, patch):
         """读-改-写：patch 是 {字节偏移: 值}，只动指定字节。"""
@@ -690,16 +695,28 @@ class Keyboard:
         等于没省电（低电量降级第一版就栽在这）。也不退出推流态：之前用
         close_sync_led 退出，固件会把点阵从存储里的图重画一遍，锁了屏点阵还亮。
 
+        灭着的时候还要**定期补一帧全黑**：固件在一段时间收不到点阵帧后，会自己
+        退出同步态、把存储的画面重画回来；熄屏期间上层改点阵配置（进自定义模式、
+        切主题、页面重连）也会把屏重新点亮。只在刚熄灭那一刻发一帧，管不住整夜。
+
         灭着的时候上层推来的画面不丢，记成「最新意图」（push_* 里写 _saved_*），
         恢复时推的是它 —— 期间换了主题，回来看到的就是新主题。
 
         锁屏判定两路：系统 WTS 通知（hud 窗口收到 LOCK/UNLOCK 写 session_locked，
         权威）；没收到过通知时退回 OpenInputDesktop 轮询（要去抖，UAC 也会让它失败）。
+
+        这个循环跟进程走，不跟连接走：连接断开时跳过，重连后接着用。以前它绑在
+        `running` 上，close() 会让它退出，极端情况下重连没把它拉起来，整晚都没人熄屏。
         """
         lock_hits = 0
-        while self.running:
+        last_off = last_ky_off = 0.0
+        while True:
             time.sleep(2.0)
             try:
+                if not self.connected():
+                    self.blanked = False
+                    last_off = last_ky_off = 0.0
+                    continue
                 lock_hits = lock_hits + 1 if locked() else 0
                 if self.session_locked is not None:
                     self.locked = self.session_locked
@@ -718,28 +735,41 @@ class Keyboard:
                             self._saved_mx = self._matrix_last
                         self._mx_off = True
                         self._send_matrix(bytes(108), now)
+                        last_off = now
                         print("[kbd] 点阵熄灭（%s）" % why, flush=True)
                     elif not mx_off and self._mx_off:
                         self._mx_off = False
+                        last_off = 0.0
                         if self._saved_mx:
                             self._send_matrix(self._saved_mx, now)
                         else:
                             self._matrix_last = None
                         self._saved_mx = None
                         print("[kbd] 点阵恢复", flush=True)
+                    elif mx_off and self._mx_off and now - last_off >= OFF_REBLANK_S:
+                        self._send_matrix(bytes(108), now)
+                        last_off = now
+                        self._off_reblank += 1
                     if ky_off and not self._ky_off:
                         if self._keys_last and any(self._keys_last):
                             self._saved_ky = self._keys_last
                         self._ky_off = True
                         if self._keys_last is not None:     # 背光在我们手里才去灭
                             self._send_keys(bytes(168), now)
+                            last_ky_off = now
                         print("[kbd] 键盘灯熄灭（%s）" % why, flush=True)
                     elif not ky_off and self._ky_off:
                         self._ky_off = False
+                        last_ky_off = 0.0
                         if self._saved_ky:
                             self._send_keys(self._saved_ky, now)
                         self._saved_ky = None
                         print("[kbd] 键盘灯恢复", flush=True)
+                    elif (ky_off and self._ky_off and self._keys_last is not None
+                          and now - last_ky_off >= OFF_REBLANK_S):
+                        self._send_keys(bytes(168), now)
+                        last_ky_off = now
+                        self._off_reblank += 1
                 self.blanked = self._mx_off and self._ky_off
             except Exception as e:
                 print("[kbd] 熄灯循环异常：%s" % e, flush=True)
@@ -784,6 +814,24 @@ class Keyboard:
                 if PACKET_GAP:
                     time.sleep(PACKET_GAP)
             self._matrix_last = flat
+
+    def _reblank_mx(self):
+        """熄屏期间又被写入了点阵配置：立刻把全黑帧盖回去。
+
+        写配置会碰 LedTFTOnOff / dsMode，固件收到后可能把存储的画面重画一遍；
+        只靠 _idle_loop 在「刚熄灭」那一刻发的一帧，屏会被重新点亮并一直亮到下次熄屏。
+        """
+        if not self._mx_off:
+            return
+        try:
+            self._send_matrix(bytes(108), time.time())
+            self._off_reblank += 1
+            now = time.time()
+            if now - self._off_log_t > 60:
+                self._off_log_t = now
+                print("[kbd] 熄屏中点阵配置被改写，已重新盖黑", flush=True)
+        except Exception:
+            pass
 
     def _send_keys(self, data, now):
         with self.lock:
@@ -994,6 +1042,7 @@ class Keyboard:
                 "product": self.product, "err": self.err, "dropped": self.dropped,
                 "wired": self.wired, "power": self._pw,
                 "blanked": self.blanked, "idle": round(idle_secs()), "locked": self.locked,
+                "off_reblank": self._off_reblank,
                 "via": self.via.ok, "via_err": self.via.err, "anim": bool(self._anim),
                 "dot": self.dot_config() if self._last_cfg is not None else None}
 
